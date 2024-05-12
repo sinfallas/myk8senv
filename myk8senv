@@ -1,0 +1,550 @@
+#!/usr/bin/env bash
+# Made by Sinfallas <sinfallas@yahoo.com>
+# Licence: GPL-2
+LC_ALL=C
+nom=$(basename "$0")
+mirandom=$(dd if=/dev/urandom bs=1 count=64 2>/dev/null | base64 -w 0 | tr -dc _A-Z-a-z-0-9 | cut -c 1-8)
+miip=$(ip addr show $(ip route | awk '/default/ { print $5 }') | grep "inet" | head -n 1 | awk '/inet/ {print $2}' | cut -d'/' -f1)
+kversion=v1.26.13
+cversion=v1.14.4
+dversion=v2.7.0
+unir=/root/unir.txt
+mylog="/var/log/$nom.log"
+LOCKFILE="/tmp/$nom_$(whoami)"
+source /usr/bin/mivariable
+
+function clean_1() {
+	rm -f /run/$nom.pid
+	rm -f "$LOCKFILE"
+}
+trap "clean_1; exit" 0 1 2 3 15
+siroot
+echo "$BASHPID" > /run/$nom.pid
+echo "" > "$mylog"
+exec 2>>"$mylog"
+lock || exit_error
+
+function ayuda() {
+	echo "Debe utilizar alguna de las siguientes opciones:"
+	echo "-8 {instalar|crear|nodo|reset|rancher|kubevirt}"
+	echo "-3 {lb|crear|server|nodo|rancher|kubevirt}"
+	echo "-d {instalar|crear|nodo|reset|rancher}"
+	echo "-u {preparar|dashboard|prueba|ip|traefik|registro|version|serv|forcedelete|fish}"
+	echo "Ejemplo: $nom -d instalar"
+	exit 1
+}
+
+if [[ -z "$1" ]]; then
+	ayuda
+fi
+
+function msg1() {
+	echo "$nom -3 crear dominio.ejemplo ipbalancer token"
+	exit 1
+}
+
+function msg2() {
+	echo "$nom -3 server dominio.ejemplo ipbalancer token ipprimerserver"
+	exit 1
+}
+
+function msg3() {
+	echo "$nom -3 nodo ipbalancer token"
+	exit 1
+}
+
+function msg4() {
+	echo "$nom -d crear nombre X X"
+	exit 1
+}
+
+function msg5() {
+	echo "$nom -d nodo nombre cluster"
+	exit 1
+}
+
+function desplegado() {
+	echo "###############################################################"
+	echo "Desplegado, vaya a https://ipprimerserver:30081 para continuar."
+	echo "###############################################################"
+}
+
+function mirancher() {
+	helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+	errores
+	helm repo update
+	errores
+	kubectl create namespace cattle-system
+	errores
+	kubectl apply --validate=false -f https://github.com/jetstack/cert-manager/releases/download/"$cversion"/cert-manager.crds.yaml
+	errores
+	kubectl create namespace cert-manager
+	errores
+	helm repo add jetstack https://charts.jetstack.io
+	errores
+	helm repo update
+	errores
+	helm install cert-manager jetstack/cert-manager --namespace cert-manager --version "$cversion"
+	errores
+	helm install rancher rancher-stable/rancher --namespace cattle-system --set ingress.enabled=false --set tls=external --set replicas="$3" --set bootstrapPassword="$mirandom"
+	errores
+	kubectl apply -f /usr/share/myk8senv/rancher.yaml
+	errores
+	kubectl -n cattle-system rollout status deploy/rancher
+	echo "$mirandom" > /root/var.txt
+	echo "###########################################################"
+	echo "A continuacion se muestra la clave de acceso a rancher:"
+	cat /root/var.txt
+	echo "###########################################################"
+}
+
+function midash() {
+	kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/"$dversion"/aio/deploy/recommended.yaml
+	errores
+	kubectl create -f /usr/share/myk8senv/dashboard.admin-user.yml
+	errores
+	echo "###########################################################"
+	echo "A continuacion se muestra el token para el dashboard:"
+	kubectl -n kubernetes-dashboard create token admin-user
+	echo "###########################################################"
+	echo "Debe ejecutar el siguiente comando desde la PC de administracion:"
+	echo "kubectl proxy"
+	echo "###########################################################"
+	echo "Desde la PC de administracion vaya a: http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/https:kubernetes-dashboard:/proxy/"
+}
+
+function mik3d() {
+	if ! [[ -f /usr/local/bin/k3d ]]; then
+		echo "ERROR: K3d no esta instalado."
+		exit 1
+	fi
+}
+
+function mik8s() {
+	if ! [[ -f /root/k8s.txt ]]; then
+		echo "ERROR: Debe ejecutar $nom -8 instalar"
+		exit 1
+	fi
+}
+
+function noswap() {
+	swapoff -a
+	sed -i '/\tswap\t/d' /etc/fstab
+}
+
+function kuninst() {
+	rm -rf /root/.kube
+	rm -rf /opt/registry
+	rm -rf /opt/k3d
+	for j in ${quienh[@]}; do
+		rm -rf /home/"$j"/.kube
+	done
+	rm -f /usr/local/bin/k3d
+	rm -f /root/k8s.txt
+	rm -f /root/var.txt
+	rm -f "$unir"
+}
+
+function kvirt() {
+	VERSION=$(curl -s https://api.github.com/repos/kubevirt/kubevirt/releases | grep tag_name | grep -v -- '-rc' | sort -r | head -1 | awk -F': ' '{print $2}' | sed 's/,//' | xargs)
+	kubectl create namespace vms
+	errores
+	kubectl create namespace apps
+	errores
+	kubectl krew install virt
+	errores
+	kubectl apply --filename https://github.com/kubevirt/kubevirt/releases/download/$VERSION/kubevirt-operator.yaml
+	errores
+	kubectl apply --filename https://github.com/kubevirt/kubevirt/releases/download/$VERSION/kubevirt-cr.yaml
+	errores
+	cd /root
+	git clone https://github.com/kubevirt-manager/kubevirt-manager.git
+	cd /root/kubevirt-manager
+	kubectl apply -f kubernetes/ns.yaml
+	errores
+	kubectl apply -f kubernetes/rbac.yaml
+	errores
+	kubectl apply -f kubernetes/deployment.yaml
+	errores
+	kubectl apply -f kubernetes/pc.yaml
+	errores
+	kubectl apply -f kubernetes/service.yaml
+	errores
+	echo "########################################################################"
+	echo "Para ver el progreso ejecute: watch kubectl --namespace kubevirt get all"
+	echo "########################################################################"
+	echo "Debe crear un ingress para que el servicio pueda ser utilizado."
+	echo "########################################################################"
+}
+
+function miserv() {
+	nombres=(apt-daily-upgrade.service unattended-upgrades.service ModemManager.service systemd-networkd-wait-online.service ufw apt-daily-upgrade.timer apt-daily.timer apt-show-versions.timer fwupd-refresh.timer motd-news.timer ua-timer.timer update-notifier-download.timer update-notifier-motd.timer)
+	for i in ${nombres[@]}; do
+		systemctl mask $i
+		systemctl stop $i
+	done
+}
+
+while getopts "8:3:d:u:" FLAG; do
+	case "${FLAG}" in
+	8)
+		case "${OPTARG}" in
+			instalar)
+				if ! [[ -d /etc/containerd ]]; then
+					mkdir /etc/containerd
+				fi
+				containerd config default > /etc/containerd/config.toml
+				sed -i 's/SystemdCgroup =.*/SystemdCgroup = true/g' /etc/containerd/config.toml
+				sed -i 's/#net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/g' /etc/sysctl.conf
+				echo "br_netfilter" > /etc/modules-load.d/k8s.conf
+				noswap
+				touch /root/k8s.txt
+				echo "Debe reiniciar el equipo."
+			;;
+
+			crear)
+				mik8s
+				if [[ -z "$3" ]]; then
+					echo "$nom -8 crear nombre"
+					exit 1
+				fi
+				kubeadm init --control-plane-endpoint="$miip" --node-name "$3" --pod-network-cidr=10.244.0.0/16 --kubernetes-version "$kversion"
+				if [[ -f /etc/kubernetes/admin.conf ]]; then
+					cp -f /etc/kubernetes/admin.conf /root/.kube/config
+					for j in ${quienh[@]}; do
+						rm -rf /home/"$j"/.kube
+						mkdir -p /home/"$j"/.kube
+						cp -f /etc/kubernetes/admin.conf /home/"$j"/.kube/config
+						chown -R "$j":"$j" /home/"$j"/.kube
+						chmod -R 777 /home/"$j"/.kube
+					done
+				fi
+				kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+				echo "Finalizado."
+			;;
+
+			nodo)
+				mik8s
+				echo "##########################################################################################"
+				echo "Para unir un nodo al cluster ejecute el siguiente comando en la maquina que desea agregar."
+				kubeadm token create --print-join-command
+				echo "##########################################################################################"
+			;;
+
+			reset)
+				echo "Eliminando cluster."
+				kubeadm reset
+				cleaniptables
+				kuninst
+			;;
+
+			rancher)
+				if [[ -z "$3" ]]; then
+					echo "$nom -8 rancher numeroreplicas"
+					exit 1
+				fi
+				mirancher
+				desplegado
+			;;
+
+			kubevirt)
+				kvirt
+				echo "Finalizado."
+			;;
+
+			*)
+				ayuda
+			;;
+		esac
+		;;
+
+	3)
+		case "${OPTARG}" in
+			lb)
+				docker run --name loadbalancer --restart=always -v /usr/share/myk8senv/nginx.conf:/etc/nginx/nginx.conf:ro -p 6443:6443 -p 80:80 -p 443:443 -p 30081:30081 -d nginx:latest
+			;;
+
+			crear)
+				if [[ -z "$3" ]]; then
+					msg1
+				fi
+				if [[ -z "$4" ]]; then
+					msg1
+				fi
+				if [[ -z "$5" ]]; then
+					msg1
+				fi
+				curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$kversion"+k3s1 sh -s - server --node-taint CriticalAddonsOnly=true:NoExecute --tls-san "$3" --tls-san "$4" --token="$5" --cluster-init
+				errores
+				if [[ -f /etc/rancher/k3s/k3s.yaml ]]; then
+					mkdir -p /root/.kube
+					cp -f /etc/rancher/k3s/k3s.yaml /root/.kube/config
+					for j in ${quienh[@]}; do
+						rm -rf /home/"$j"/.kube
+						mkdir -p /home/"$j"/.kube
+						cp -f /etc/rancher/k3s/k3s.yaml /home/"$j"/.kube/config
+						chown -R "$j":"$j" /home/"$j"/.kube
+						chmod -R 777 /home/"$j"/.kube
+					done
+				fi
+				echo "###############################################################" > "$unir"
+				echo "SERVIDOR:" >> "$unir"
+				echo "$nom -3 server $3 $4 $5 $miip" >> "$unir"
+				echo "###############################################################" >> "$unir"
+				echo "NODO:" >> "$unir"
+				echo "$nom -3 nodo $4 $5" >> "$unir"
+				echo "###############################################################" >> "$unir"
+				cat "$unir"
+				echo "Finalizado."
+			;;
+
+			server)
+				if [[ -z "$3" ]]; then
+					msg2
+				fi
+				if [[ -z "$4" ]]; then
+					msg2
+				fi
+				if [[ -z "$5" ]]; then
+					msg2
+				fi
+				if [[ -z "$6" ]]; then
+					msg2
+				fi
+				curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$kversion"+k3s1 sh -s - server --node-taint CriticalAddonsOnly=true:NoExecute --tls-san "$3" --tls-san "$4" --token "$5" --server https://"$6":6443
+				errores
+				echo "Finalizado."
+			;;
+
+			nodo)
+				if [[ -z "$3" ]]; then
+					msg3
+				fi
+				if [[ -z "$4" ]]; then
+					msg3
+				fi
+				curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$kversion"+k3s1 K3S_URL=https://"$3":6443 K3S_TOKEN="$4" sh -
+				errores
+				echo "Finalizado."
+			;;
+
+			rancher)
+				if [[ -z "$3" ]]; then
+					echo "$nom -3 rancher numeroreplicas"
+					exit 1
+				fi
+				mirancher
+				desplegado
+			;;
+
+			kubevirt)
+				kvirt
+				echo "Finalizado."
+			;;
+
+			*)
+				ayuda
+			;;
+		esac
+		;;
+
+	d)
+		case "${OPTARG}" in
+			instalar)
+				curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+				if ! [[ -d /opt/k3d ]]; then
+					mkdir -p /opt/k3d
+					chmod -R 777 /opt/k3d
+				fi
+				mkdir -p /root/.kube
+				echo "Se recomienda reiniciar el equipo."
+			;;
+
+			crear)
+				mik3d
+				if [[ -z "$3" ]]; then
+					msg4
+				fi
+				if [[ -z "$4" ]]; then
+					msg4
+				fi
+				if [[ -z "$5" ]]; then
+					msg4
+				fi
+				if [[ $(($4 % 2)) == 0 ]]; then
+					echo "ERROR: El numero de servidores debe ser IMPAR."
+					exit 1
+				fi
+				k3d cluster create "$3" --servers "$4" --agents "$5" --image rancher/k3s:"$kversion"-k3s1 -v /opt/k3d:/var/lib/rancher/k3s/storage@all -p "8900:30080@agent:0" -p "8901:30081@agent:0" -p "8902:30082@agent:0" -p "30000-30050:30000-30050@server:0" -p "9000:9000@server:0" -p "9090:9090@server:0" -p "80:80@loadbalancer:*" -p "443:443@loadbalancer:*"
+				k3d kubeconfig get "$3" > /root/.kube/config
+				for j in ${quienh[@]}; do
+					rm -rf /home/"$j"/.kube
+					mkdir -p /home/"$j"/.kube
+					k3d kubeconfig get "$3" > /home/"$j"/.kube/config
+					chown -R "$j":"$j" /home/"$j"/.kube
+					chmod -R 777 /home/"$j"/.kube
+				done
+				echo "Finalizado."
+			;;
+
+			rancher)
+				mik3d
+				if [[ -z "$3" ]]; then
+					echo "$nom -d rancher numeroreplicas"
+					exit 1
+				fi
+				mirancher
+				echo "###########################################################"
+				echo "Desplegado, vaya a https://127.0.0.1:8901 para continuar."
+				echo "###########################################################"
+			;;
+
+			reset)
+				mik3d
+				if [[ -z "$3" ]]; then
+					echo "$nom -d reset nombre"
+					exit 1
+				fi
+				k3d cluster delete "$3"
+				kuninst
+				echo "Finalizado."
+			;;
+
+			nodo)
+				mik3d
+				if [[ -z "$3" ]]; then
+					msg5
+				fi
+				if [[ -z "$4" ]]; then
+					msg5
+				fi
+				k3d node create "$3" -c "$4"
+				echo "Finalizado."
+			;;
+
+			*)
+				ayuda
+			;;
+		esac
+		;;
+
+	u)
+		case "${OPTARG}" in
+			preparar)
+				rm -f /etc/machine-id
+				dbus-uuidgen --ensure=/etc/machine-id
+				if [[ -z $(grep -i 'send dhcp-client-identifier = hardware;' /etc/dhcp/dhclient.conf) ]]; then
+					echo "send dhcp-client-identifier = hardware;" >> /etc/dhcp/dhclient.conf
+				fi
+				if [[ -z "$3" ]]; then
+					hostnamectl set-hostname "$mirandom"
+					sed -i "s/127.0.0.1.*/127.0.0.1\tlocalhost $mirandom/g" /etc/hosts
+					sed -i "s/127.0.1.1.*/127.0.1.1\t$mirandom/g" /etc/hosts
+				else
+					hostnamectl set-hostname "$3"
+					sed -i "s/127.0.0.1.*/127.0.0.1\tlocalhost $3/g" /etc/hosts
+					sed -i "s/127.0.1.1.*/127.0.1.1\t$3/g" /etc/hosts
+				fi
+				noswap
+				apt-get clean
+				miserv
+				kuninst
+				echo "Debe reiniciar el equipo."
+			;;
+
+			dashboard)
+				midash
+			;;
+
+			prueba)
+				if [[ -z "$3" ]]; then
+					echo "$nom -u prueba replicas dominio.ejemplo"
+					exit 1
+				fi
+				if [[ -z "$4" ]]; then
+					echo "$nom -u prueba replicas dominio.ejemplo"
+					exit 1
+				fi
+				sed -i 's/- host:.*/- host: "'$4'"/g' /usr/share/myk8senv/prueba.yaml
+				kubectl apply -f /usr/share/myk8senv/prueba.yaml
+				kubectl scale --replicas="$3" deployment nginx
+				echo "Finalizado."
+			;;
+
+			ip)
+				echo "Mi IP es: $miip"
+			;;
+
+			traefik)
+				if [[ -z "$3" ]]; then
+					echo "$nom -u traefik replicas"
+					exit 1
+				fi
+				echo "################################################################"
+				echo "Traefik, vaya a http://localhost:9000/dashboard/ para continuar."
+				echo "################################################################"
+				kubectl --namespace kube-system port-forward deployments/traefik 9000:9000 &
+				kubectl scale --replicas="$3" deployment traefik --namespace kube-system
+			;;
+
+			registro)
+				docker run -d -p 8081:8081 --name nexus sonatype/nexus3:latest
+				sleep 15
+				echo "################################################################"
+				echo "Esta sera su clave de la cuenta admin"
+				echo "################################################################"
+				docker exec -t nexus cat /nexus-data/admin.password
+				echo "################################################################"
+				echo "Vaya a http://$miip:8081 para finalizar la instalacion"
+				echo "################################################################"
+			;;
+
+			version)
+				a=$(dpkg -s myk8senv | grep '^Version:' | awk '{print $2}')
+				b=${a%~*}
+				up=$(curl -s https://code.launchpad.net/~sinfallas/+recipe/myk8senv | grep deb-version | tail +2 | cut -d# -f2 | awk '{print $7}' | cut -c 2- | sed 's/.\{2\}$//')
+				echo "Version actual: $b"
+				echo "Version disponible: $up"
+				echo "K3s version: $kversion+k3s1"
+				echo "Cert-manager version: $cversion"
+				echo "Dashboard version: $dversion"
+			;;
+
+			serv)
+				miserv
+			;;
+
+			forcedelete)
+				if [[ -z "$3" ]]; then
+					echo "$nom -u forcedelete namespace"
+					exit 1
+				fi
+				(
+				kubectl proxy &
+				kubectl get namespace $3 -o json |jq '.spec = {"finalizers":[]}' >temp.json
+				curl -k -H "Content-Type: application/json" -X PUT --data-binary @temp.json 127.0.0.1:8001/api/v1/namespaces/$3/finalize
+				)
+			;;
+
+			fish)
+				if [[ $(dpkg --get-selections | grep -w "fish" | awk '{print $1}' | head -1) = fish ]]; then
+					for j in ${quienh[@]}; do
+						echo 'kubectl completion fish | source' >> /home/"$j"/.config/fish/config.fish
+					done
+				else
+					echo "ERROR: El paquete FISH no esta instalado."
+				fi
+			;;
+
+			*)
+				ayuda
+			;;
+		esac
+		;;
+
+	*)
+		ayuda
+		;;
+	esac
+done
+exit 0
